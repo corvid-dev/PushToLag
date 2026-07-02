@@ -24,20 +24,16 @@ Launch via a shortcut set to "Run as administrator"; it warns and exits if not e
 
 ## Build an .exe
 
-Make sure the dependencies above are installed, then:
+Make sure the dependencies above are installed, then build from the spec file:
 
 ```
 pip install pyinstaller
-pyinstaller --onefile --windowed --name PushToLag PushToLag.py
+pyinstaller PushToLag.spec
 ```
 
-Output lands in `dist\PushToLag.exe`. Point an admin-elevated shortcut at it. `--windowed` avoids a console window flash.
+Output lands in `dist\PushToLag.exe`. Point an admin-elevated shortcut at it.
 
-To bundle an icon (`PushToLagIcon.ico` in this folder):
-
-```
-pyinstaller --onefile --windowed --name PushToLag --icon PushToLagIcon.ico --add-data "PushToLagIcon.ico;." PushToLag.py
-```
+The spec already bundles `PushToLagIcon.ico` (both as the .exe's file icon and for the app's runtime window icon) — just make sure that file exists in this folder before building. If you swap in a different icon file, update the `icon=` and `datas=` entries in `PushToLag.spec` to match.
 
 ## Settings
 

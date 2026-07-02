@@ -1,5 +1,5 @@
 """
-PushToLag v1.0 — Push-to-Disconnect for Windows 11
+PushToLag v1.1 — Push-to-Disconnect for Windows 11
 Hold ONE global key to cut network access to every app you've added, release to
 reconnect them all after a shared delay. Uses Windows Firewall rules per app,
 driven entirely through the in-process Windows Firewall COM API (no netsh.exe
@@ -29,7 +29,7 @@ try:
 except ImportError:
     com = None
 
-VERSION = "1.0"
+VERSION = "1.1"
 
 APP_BG="#1e1e1e"; PANEL_BG="#2a2a2a"; COL_BG="#252525"; DIVIDER="#333333"
 ACCENT="#00b894"; ACCENT_OFF="#e17055"; TEXT="#ececec"; MUTED="#888888"
@@ -96,8 +96,9 @@ class Settings:
             with open(PREFS_PATH, encoding="utf-8") as f: self._data = json.load(f)
         except Exception:
             self._data = {}
-    def save(self, app_count, keybinds, delay_ms, app_states):
-        data = {"app_count": app_count, "keybinds": list(keybinds), "delay_ms": delay_ms}
+    def save(self, app_count, keybinds, delay_ms, app_states, search_query):
+        data = {"app_count": app_count, "keybinds": list(keybinds), "delay_ms": delay_ms,
+                "search_query": search_query}
         data.update({f"ch{i}": s.to_dict() for i, s in enumerate(app_states)})
         self._data = data
         try:
@@ -111,6 +112,8 @@ class Settings:
     def keybinds(self): return list(self._data.get("keybinds", []))
     @property
     def delay_ms(self): return int(self._data.get("delay_ms", 250))
+    @property
+    def search_query(self): return self._data.get("search_query", "")
     def app_dict(self, i): return self._data.get(f"ch{i}", {})
 
 def is_admin():
@@ -456,7 +459,7 @@ class MainWindow:
     Same pattern AppRow/KeybindManager/FirewallService already use."""
     def __init__(self, root, *, initial_delay, initial_keybinds, on_add_app, on_add_key,
                  on_remove_key, on_clear_rules, on_delay_change, on_delay_commit, on_search_change,
-                 restarted=False):
+                 initial_search="", restarted=False):
         self.root = root; self._on_remove_key = on_remove_key
         self._was_zoomed = False
         root.bind("<Configure>", self._on_root_configure)
@@ -472,7 +475,7 @@ class MainWindow:
         hdr = tk.Frame(outer, bg=APP_BG); hdr.pack(fill="x", padx=12, pady=(10,4))
         _lbl(hdr, "Apps", APP_BG, font=FONT_LG_B).pack(side="left")
         _btn(hdr, "+ Add App", lambda: on_add_app(), "#3a3a3a").pack(side="right")
-        self._search_var = tk.StringVar()
+        self._search_var = tk.StringVar(value=initial_search)
         self._search_var.trace_add("write", lambda *_: on_search_change(self._search_var.get()))
         search = tk.Entry(hdr, textvariable=self._search_var, bg=PANEL_BG, fg=TEXT,
                            insertbackground=TEXT, relief="flat", font=FONT_MD)
@@ -555,7 +558,7 @@ class App:
         self._rows: list[AppRow] = []
         self._g_delay = self._settings.delay_ms
         self._last_app_map = {}
-        self._search_query = ""
+        self._search_query = self._settings.search_query
         self._fw = FirewallService(root, on_error=self._on_backend_error)
         self._fw.start()
         self._reconnect = ReconnectScheduler(lambda: self._g_delay, self._on_reconnect_fire)
@@ -567,6 +570,7 @@ class App:
                                on_remove_key=self._rm_key, on_clear_rules=self._clear_all_rules,
                                on_delay_change=self._on_delay_change, on_delay_commit=self._save,
                                on_search_change=self._on_search_change,
+                               initial_search=self._search_query,
                                restarted=os.environ.get(RESTART_ENV_VAR) == "1")
         self._restore()
         self._keys.start()
@@ -615,6 +619,7 @@ class App:
     def _on_search_change(self, query):
         self._search_query = query
         self._apply_filter()
+        self._save()
     def _apply_filter(self):
         q = self._search_query.strip().lower()
         filtered = self._last_app_map if not q else \
@@ -695,7 +700,7 @@ class App:
         self._save(); self._enumerate_all(); self._refresh_arrows(); self._ui.fit()
     def _save(self):
         self._settings.save(len(self._apps), self._keys.keybinds, self._g_delay,
-                             [e.state for e in self._apps])
+                             [e.state for e in self._apps], self._search_query)
     def _quit(self):
         self._save(); self._reconnect.cancel(); self._keys.stop()
         self._fw.send("quit"); self.root.destroy()
