@@ -17,10 +17,10 @@ pip install pynput psutil comtypes
 ## Run
 
 ```
-python PushToLagv4.py
+python PushToLag.py
 ```
 
-Launch via a shortcut set to "Run as administrator" — the app no longer self-elevates; it warns and exits if not elevated.
+Launch via a shortcut set to "Run as administrator"; it warns and exits if not elevated.
 
 ## Build an .exe
 
@@ -28,7 +28,7 @@ Make sure the dependencies above are installed, then:
 
 ```
 pip install pyinstaller
-pyinstaller --onefile --windowed --name PushToLag PushToLagv4.py
+pyinstaller --onefile --windowed --name PushToLag PushToLag.py
 ```
 
 Output lands in `dist\PushToLag.exe`. Point an admin-elevated shortcut at it. `--windowed` avoids a console window flash.
@@ -36,7 +36,7 @@ Output lands in `dist\PushToLag.exe`. Point an admin-elevated shortcut at it. `-
 To bundle an icon (`PushToLagIcon.ico` in this folder):
 
 ```
-pyinstaller --onefile --windowed --name PushToLag --icon PushToLagIcon.ico --add-data "PushToLagIcon.ico;." PushToLagv4.py
+pyinstaller --onefile --windowed --name PushToLag --icon PushToLagIcon.ico --add-data "PushToLagIcon.ico;." PushToLag.py
 ```
 
 ## Settings
