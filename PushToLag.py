@@ -1,5 +1,4 @@
 """
-LEGACY VERSION - BEFORE LAYER SEPARATION.
 PushToLag v1.0 — Push-to-Disconnect for Windows 11
 Hold ONE global key to cut network access to every app you've added, release to
 reconnect them all after a shared delay. Uses Windows Firewall rules per app,
