@@ -1,9 +1,13 @@
 """
-PushToLag v1.1 — Push-to-Disconnect for Windows 11
+PushToLag v1.2 — Push-to-Disconnect for Windows 11
 Hold ONE global key to cut network access to every app you've added, release to
 reconnect them all after a shared delay. Uses Windows Firewall rules per app,
 driven entirely through the in-process Windows Firewall COM API (no netsh.exe
 shelling out — every rule toggle is just a property set).
+
+v1.2 adds an optional on-screen overlay: a small square (green/red, both
+colors user-configurable) that shows whether the network is currently
+connected or disconnected.
 
 pip install pynput psutil comtypes
 
@@ -15,7 +19,7 @@ from dataclasses import dataclass, field
 from functools import lru_cache
 from typing import Callable, Optional
 import tkinter as tk
-from tkinter import ttk, messagebox
+from tkinter import ttk, messagebox, colorchooser
 from pynput import keyboard, mouse
 
 try:
@@ -29,7 +33,7 @@ try:
 except ImportError:
     com = None
 
-VERSION = "1.1"
+VERSION = "1.2"
 
 APP_BG="#1e1e1e"; PANEL_BG="#2a2a2a"; COL_BG="#252525"; DIVIDER="#333333"
 ACCENT="#00b894"; ACCENT_OFF="#e17055"; TEXT="#ececec"; MUTED="#888888"
@@ -50,6 +54,38 @@ NET_FW_PROFILE2_ALL = 0x7FFFFFFF
 
 PREFS_PATH = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), "PushToLag", "prefs.json")
 RESTART_ENV_VAR = "PUSHTOLAG_RESTARTED"  # set on the one auto-restart we allow after a backend init failure
+
+# ── screen overlay (Windows only; degrades to a plain window elsewhere) ─────
+try:
+    _user32 = ctypes.windll.user32
+    HAVE_WIN32 = True
+except AttributeError:
+    _user32 = None
+    HAVE_WIN32 = False
+
+GWL_EXSTYLE = -20
+WS_EX_LAYERED = 0x00080000
+WS_EX_TRANSPARENT = 0x00000020
+WS_EX_TOOLWINDOW = 0x00000080
+WDA_EXCLUDEFROMCAPTURE = 0x00000011
+LWA_COLORKEY = 0x00000001
+
+if HAVE_WIN32:
+    _user32.GetWindowLongPtrW.restype = ctypes.c_void_p
+    _user32.GetWindowLongPtrW.argtypes = [ctypes.c_void_p, ctypes.c_int]
+    _user32.SetWindowLongPtrW.restype = ctypes.c_void_p
+    _user32.SetWindowLongPtrW.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p]
+    _user32.SetWindowDisplayAffinity.restype = ctypes.c_bool
+    _user32.SetWindowDisplayAffinity.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
+    _user32.SetLayeredWindowAttributes.restype = ctypes.c_bool
+    _user32.SetLayeredWindowAttributes.argtypes = [
+        ctypes.c_void_p, ctypes.c_uint32, ctypes.c_ubyte, ctypes.c_uint32
+    ]
+
+OVERLAY_POSITIONS = ("Top-left", "Top-right", "Bottom-left", "Bottom-right")
+DEFAULT_OVERLAY_POSITION = "Top-right"
+DEFAULT_OVERLAY_OFFSET = 24
+DEFAULT_OVERLAY_COLORS = {"connected": ACCENT, "disconnected": ACCENT_OFF}
 
 MOUSE_LABELS = {
     mouse.Button.left:"Mouse-Left", mouse.Button.right:"Mouse-Right",
@@ -96,10 +132,11 @@ class Settings:
             with open(PREFS_PATH, encoding="utf-8") as f: self._data = json.load(f)
         except Exception:
             self._data = {}
-    def save(self, app_count, keybinds, delay_ms, app_states, search_query):
+    def save(self, app_count, keybinds, delay_ms, app_states, search_query, overlay):
         data = {"app_count": app_count, "keybinds": list(keybinds), "delay_ms": delay_ms,
                 "search_query": search_query}
         data.update({f"ch{i}": s.to_dict() for i, s in enumerate(app_states)})
+        data.update(overlay)
         self._data = data
         try:
             os.makedirs(os.path.dirname(PREFS_PATH), exist_ok=True)
@@ -115,6 +152,15 @@ class Settings:
     @property
     def search_query(self): return self._data.get("search_query", "")
     def app_dict(self, i): return self._data.get(f"ch{i}", {})
+    @property
+    def overlay_enabled(self): return bool(self._data.get("overlay_enabled", False))
+    @property
+    def overlay_position(self): return self._data.get("overlay_position", DEFAULT_OVERLAY_POSITION)
+    @property
+    def overlay_offset_x(self): return int(self._data.get("overlay_offset_x", DEFAULT_OVERLAY_OFFSET))
+    @property
+    def overlay_offset_y(self): return int(self._data.get("overlay_offset_y", DEFAULT_OVERLAY_OFFSET))
+    def overlay_color(self, state): return self._data.get(f"overlay_color_{state}", DEFAULT_OVERLAY_COLORS[state])
 
 def is_admin():
     try: return bool(ctypes.windll.shell32.IsUserAnAdmin())
@@ -316,6 +362,7 @@ class AppEntry:
     def __init__(self, state, index):
         self.state = state; self.index = index
         self.status_text, self.status_color = "● INACTIVE", MUTED
+        self.attached = None  # None: no app selected, True: rule attached ok, False: rule error
         self.on_status_change = None
     def set_status(self, text, color):
         self.status_text, self.status_color = text, color
@@ -334,9 +381,9 @@ class AppRow:
     refresh_apps() takes both the full process map (to correctly tell "not
     running" apart from "just filtered out") and the header-filtered map
     (what the dropdown actually offers)."""
-    def __init__(self, entry, on_select, on_move, on_remove, on_refresh):
+    def __init__(self, entry, on_select, on_move, on_remove):
         self._entry, self._on_select = entry, on_select
-        self._on_move, self._on_remove, self._on_refresh = on_move, on_remove, on_refresh
+        self._on_move, self._on_remove = on_move, on_remove
         self._display_to_path = {}   # display text -> app_path, rebuilt each refresh
         self.frame = self._idxlbl = self._svar = self._slbl = self._combo = None
         self._btn_u = self._btn_d = None
@@ -354,7 +401,6 @@ class AppRow:
         self._combo["values"] = [NONE_OPTION]; self._combo.current(0)
         self._combo.pack(side="left", fill="x", expand=True, padx=4)
         self._combo.bind("<<ComboboxSelected>>", self._on_app_selected)
-        _btn(inner, "⟳", lambda: self._on_refresh(), COL_BG, MUTED, TEXT, font=FONT_MD).pack(side="left", padx=2)
         self._svar = tk.StringVar(value=self._entry.status_text)
         self._slbl = _lbl(inner, "", COL_BG, textvariable=self._svar, font=FONT_SM_B, width=13, anchor="e")
         self._slbl.pack(side="left", padx=4); self._slbl.config(fg=self._entry.status_color)
@@ -458,7 +504,10 @@ class MainWindow:
     the methods below (set_disconnect_timing, rebuild_keybinds, …).
     Same pattern AppRow/KeybindManager/FirewallService already use."""
     def __init__(self, root, *, initial_delay, initial_keybinds, on_add_app, on_add_key,
-                 on_remove_key, on_clear_rules, on_delay_change, on_delay_commit, on_search_change,
+                 on_remove_key, on_clear_rules, on_delay_change, on_delay_commit, on_search_change, on_refresh,
+                 initial_overlay_enabled, initial_overlay_position, initial_overlay_offset_x,
+                 initial_overlay_offset_y, initial_overlay_color_connected, initial_overlay_color_disconnected,
+                 on_overlay_toggle, on_overlay_position_change, on_overlay_offset_change, on_overlay_color_click,
                  initial_search="", restarted=False):
         self.root = root; self._on_remove_key = on_remove_key
         self._was_zoomed = False
@@ -471,10 +520,15 @@ class MainWindow:
         outer = tk.Frame(root, bg=APP_BG); outer.pack(fill="both", expand=True)
         self._outer = outer
         self._build_status_bar(outer)
-        self._build_global_bar(outer, initial_delay, on_add_key, on_delay_change, on_delay_commit, restarted)
+        self._build_global_bar(outer, initial_delay, on_add_key, on_delay_change, on_delay_commit, restarted,
+                                initial_overlay_enabled, initial_overlay_position, initial_overlay_offset_x,
+                                initial_overlay_offset_y, initial_overlay_color_connected,
+                                initial_overlay_color_disconnected, on_overlay_toggle,
+                                on_overlay_position_change, on_overlay_offset_change, on_overlay_color_click)
         hdr = tk.Frame(outer, bg=APP_BG); hdr.pack(fill="x", padx=12, pady=(10,4))
         _lbl(hdr, "Apps", APP_BG, font=FONT_LG_B).pack(side="left")
         _btn(hdr, "+ Add App", lambda: on_add_app(), "#3a3a3a").pack(side="right")
+        _btn(hdr, "⟳ Refresh", lambda: on_refresh(), "#3a3a3a").pack(side="right", padx=(0,6))
         self._search_var = tk.StringVar(value=initial_search)
         self._search_var.trace_add("write", lambda *_: on_search_change(self._search_var.get()))
         search = tk.Entry(hdr, textvariable=self._search_var, bg=PANEL_BG, fg=TEXT,
@@ -492,11 +546,21 @@ class MainWindow:
         self._reconnect_var = tk.StringVar(value="Last reconnect: —")
         _lbl(inner, "", PANEL_BG, textvariable=self._disconnect_var, font=FONT_SM).pack(side="left")
         _lbl(inner, "", PANEL_BG, textvariable=self._reconnect_var, font=FONT_SM).pack(side="right")
-    def _build_global_bar(self, parent, initial_delay, on_add_key, on_delay_change, on_delay_commit, restarted):
+    def _build_global_bar(self, parent, initial_delay, on_add_key, on_delay_change, on_delay_commit, restarted,
+                           initial_overlay_enabled, initial_overlay_position, initial_overlay_offset_x,
+                           initial_overlay_offset_y, initial_overlay_color_connected,
+                           initial_overlay_color_disconnected, on_overlay_toggle,
+                           on_overlay_position_change, on_overlay_offset_change, on_overlay_color_click):
         inner = _panel(parent, pady=8, divider=False)
         self._build_keybind_row(inner, on_add_key)
         tk.Frame(inner, bg=DIVIDER, height=1).pack(fill="x", pady=8)
         self._build_delay_row(inner, initial_delay, on_delay_change, on_delay_commit, restarted)
+        tk.Frame(inner, bg=DIVIDER, height=1).pack(fill="x", pady=8)
+        self._build_overlay_row(inner, initial_overlay_enabled, initial_overlay_position,
+                                 initial_overlay_offset_x, initial_overlay_offset_y,
+                                 initial_overlay_color_connected, initial_overlay_color_disconnected,
+                                 on_overlay_toggle, on_overlay_position_change, on_overlay_offset_change,
+                                 on_overlay_color_click)
     def _build_keybind_row(self, inner, on_add_key):
         krow = tk.Frame(inner, bg=PANEL_BG); krow.pack(fill="x")
         _lbl(krow, "Global Keybind (holds ALL apps)", PANEL_BG, font=FONT_LG_B).pack(side="left")
@@ -518,6 +582,50 @@ class MainWindow:
         scale.bind("<ButtonRelease-1>", lambda _: on_delay_commit())
         scale.bind("<Button-2>", lambda e: "break")
         scale.bind("<Button-3>", lambda e: "break")
+    def _build_overlay_row(self, inner, initial_enabled, initial_position, initial_offset_x,
+                            initial_offset_y, initial_color_connected, initial_color_disconnected,
+                            on_toggle, on_position_change, on_offset_change, on_color_click):
+        orow = tk.Frame(inner, bg=PANEL_BG); orow.pack(fill="x")
+        _lbl(orow, "Network Overlay", PANEL_BG, font=FONT_LG_B).pack(side="left")
+        self._ovar = tk.BooleanVar(value=initial_enabled)
+        tk.Checkbutton(orow, variable=self._ovar, bg=PANEL_BG, fg=TEXT, activebackground=PANEL_BG,
+                       activeforeground=TEXT, selectcolor=COL_BG, highlightthickness=0,
+                       command=lambda: on_toggle(self._ovar.get())).pack(side="left", padx=(8,0))
+        _lbl(orow, "Position:", PANEL_BG, font=FONT_SM).pack(side="left", padx=(10,4))
+        self._opos_var = tk.StringVar(value=initial_position)
+        opos_combo = ttk.Combobox(orow, state="readonly", width=12, font=FONT_SM,
+                                   values=OVERLAY_POSITIONS, textvariable=self._opos_var)
+        opos_combo.pack(side="left")
+        opos_combo.bind("<<ComboboxSelected>>", lambda e: on_position_change(self._opos_var.get()))
+        orow2 = tk.Frame(inner, bg=PANEL_BG); orow2.pack(fill="x", pady=(6,0))
+        _lbl(orow2, "Connected:", PANEL_BG, font=FONT_SM).pack(side="left")
+        self._ocolor_connected_btn = _btn(orow2, "Color...", lambda: on_color_click("connected"), "#3a3a3a")
+        self._ocolor_connected_btn.config(bg=initial_color_connected)
+        self._ocolor_connected_btn.pack(side="left", padx=(4,16))
+        _lbl(orow2, "Disconnected:", PANEL_BG, font=FONT_SM).pack(side="left")
+        self._ocolor_disconnected_btn = _btn(orow2, "Color...", lambda: on_color_click("disconnected"), "#3a3a3a")
+        self._ocolor_disconnected_btn.config(bg=initial_color_disconnected)
+        self._ocolor_disconnected_btn.pack(side="left", padx=(4,0))
+        orow3 = tk.Frame(inner, bg=PANEL_BG); orow3.pack(fill="x", pady=(6,0))
+        _lbl(orow3, "X offset:", PANEL_BG, font=FONT_SM).pack(side="left")
+        self._ox_var = tk.IntVar(value=initial_offset_x)
+        self._ox_var.trace_add("write", lambda *_: on_offset_change(self._safe_int(self._ox_var, initial_offset_x),
+                                                                     self._safe_int(self._oy_var, initial_offset_y)))
+        tk.Entry(orow3, textvariable=self._ox_var, width=5, bg=COL_BG, fg=TEXT,
+                 insertbackground=TEXT, relief="flat").pack(side="left", padx=(4,12))
+        _lbl(orow3, "Y offset:", PANEL_BG, font=FONT_SM).pack(side="left")
+        self._oy_var = tk.IntVar(value=initial_offset_y)
+        self._oy_var.trace_add("write", lambda *_: on_offset_change(self._safe_int(self._ox_var, initial_offset_x),
+                                                                     self._safe_int(self._oy_var, initial_offset_y)))
+        tk.Entry(orow3, textvariable=self._oy_var, width=5, bg=COL_BG, fg=TEXT,
+                 insertbackground=TEXT, relief="flat").pack(side="left", padx=(4,0))
+    @staticmethod
+    def _safe_int(var, default):
+        try: return max(0, int(var.get()))
+        except (tk.TclError, ValueError): return default
+    def set_overlay_color(self, state, color):
+        btn = self._ocolor_connected_btn if state == "connected" else self._ocolor_disconnected_btn
+        if btn: btn.config(bg=color)
     def _on_root_configure(self, _=None):
         zoomed = self.root.state() == "zoomed"
         if self._was_zoomed and not zoomed: self.fit()
@@ -544,6 +652,103 @@ class MainWindow:
             _btn(r, "✕", lambda l=label: self._on_remove_key(l), COL_BG, MUTED, ACCENT_OFF,
                  font=FONT_SM).pack(side="left", padx=(0,6))
 
+class Overlay:
+    """Persistent colored square showing network state: green while
+    connected, red while lagging (both colors user-configurable).
+    Uses Windows click-through and capture-exclusion features when available."""
+
+    _SQUARE_SIZE = 12
+
+    def __init__(self, root):
+        self._root = root
+        self._win = None
+        self._square = None
+        self._position = DEFAULT_OVERLAY_POSITION
+        self._offset_x = DEFAULT_OVERLAY_OFFSET
+        self._offset_y = DEFAULT_OVERLAY_OFFSET
+        self._colors = dict(DEFAULT_OVERLAY_COLORS)
+        self._state = "connected"
+
+    def set_position(self, position):
+        self._position = position if position in OVERLAY_POSITIONS else DEFAULT_OVERLAY_POSITION
+        self._reposition()
+
+    def set_offset(self, offset_x, offset_y):
+        """Set the horizontal and vertical distance from the selected corner."""
+        self._offset_x = max(0, offset_x)
+        self._offset_y = max(0, offset_y)
+        self._reposition()
+
+    def set_state(self, state):
+        self._state = state
+        if self._square is not None:
+            self._square.config(bg=self._colors.get(state, DEFAULT_OVERLAY_COLORS["connected"]))
+
+    def set_color(self, state, color):
+        self._colors[state] = color
+        if self._square is not None and self._state == state:
+            self._square.config(bg=color)
+
+    def show(self):
+        if self._win is not None:
+            return
+        win = tk.Toplevel(self._root)
+        win.overrideredirect(True)
+        win.attributes("-topmost", True)
+        win.configure(bg="black")
+        try:
+            win.attributes("-transparentcolor", "black")  # Windows-only Tk feature
+        except tk.TclError:
+            pass
+        self._square = tk.Frame(
+            win, bg=self._colors.get(self._state, DEFAULT_OVERLAY_COLORS["connected"]),
+            width=self._SQUARE_SIZE, height=self._SQUARE_SIZE,
+        )
+        self._square.pack_propagate(False)
+        self._square.pack()
+        self._win = win
+        self._reposition()
+        self._apply_click_through()
+        self._apply_capture_exclusion()
+
+    def hide(self):
+        if self._win is not None:
+            self._win.destroy()
+            self._win = None
+            self._square = None
+
+    def _reposition(self):
+        if self._win is None:
+            return
+        self._win.update_idletasks()
+        w = self._win.winfo_reqwidth()
+        h = self._win.winfo_reqheight()
+        sw = self._win.winfo_screenwidth()
+        sh = self._win.winfo_screenheight()
+        mx, my = self._offset_x, self._offset_y
+        x, y = {
+            "Top-left": (mx, my),
+            "Top-right": (sw - w - mx, my),
+            "Bottom-left": (mx, sh - h - my),
+            "Bottom-right": (sw - w - mx, sh - h - my),
+        }.get(self._position, (sw - w - mx, my))
+        self._win.geometry(f"{w}x{h}+{x}+{y}")
+
+    def _apply_click_through(self):
+        if not HAVE_WIN32 or self._win is None:
+            return
+        hwnd = self._win.winfo_id()
+        style = int(_user32.GetWindowLongPtrW(hwnd, GWL_EXSTYLE) or 0)
+        style |= WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOOLWINDOW
+        _user32.SetWindowLongPtrW(hwnd, GWL_EXSTYLE, style)
+        _user32.SetLayeredWindowAttributes(hwnd, 0x000000, 0, LWA_COLORKEY)
+
+    def _apply_capture_exclusion(self):
+        if not HAVE_WIN32 or self._win is None:
+            return
+        _user32.SetWindowDisplayAffinity(self._win.winfo_id(), WDA_EXCLUDEFROMCAPTURE)
+
+
 class App:
     """Owns firewall/keybind/settings state and drives MainWindow; knows
     nothing about how a widget is built, only which MainWindow method to
@@ -559,6 +764,19 @@ class App:
         self._g_delay = self._settings.delay_ms
         self._last_app_map = {}
         self._search_query = self._settings.search_query
+        self._disconnected = False  # true from the moment apps are blocked until reconnect fires
+        self._ov_enabled = self._settings.overlay_enabled
+        self._ov_position = self._settings.overlay_position
+        self._ov_offset_x = self._settings.overlay_offset_x
+        self._ov_offset_y = self._settings.overlay_offset_y
+        self._ov_color_connected = self._settings.overlay_color("connected")
+        self._ov_color_disconnected = self._settings.overlay_color("disconnected")
+        self._overlay = Overlay(root)
+        self._overlay.set_position(self._ov_position)
+        self._overlay.set_offset(self._ov_offset_x, self._ov_offset_y)
+        self._overlay.set_color("connected", self._ov_color_connected)
+        self._overlay.set_color("disconnected", self._ov_color_disconnected)
+        self._overlay.set_state("connected")
         self._fw = FirewallService(root, on_error=self._on_backend_error)
         self._fw.start()
         self._reconnect = ReconnectScheduler(lambda: self._g_delay, self._on_reconnect_fire)
@@ -570,16 +788,28 @@ class App:
                                on_remove_key=self._rm_key, on_clear_rules=self._clear_all_rules,
                                on_delay_change=self._on_delay_change, on_delay_commit=self._save,
                                on_search_change=self._on_search_change,
+                               on_refresh=self._enumerate_all,
+                               initial_overlay_enabled=self._ov_enabled,
+                               initial_overlay_position=self._ov_position,
+                               initial_overlay_offset_x=self._ov_offset_x,
+                               initial_overlay_offset_y=self._ov_offset_y,
+                               initial_overlay_color_connected=self._ov_color_connected,
+                               initial_overlay_color_disconnected=self._ov_color_disconnected,
+                               on_overlay_toggle=self._on_overlay_toggle,
+                               on_overlay_position_change=self._on_overlay_position_change,
+                               on_overlay_offset_change=self._on_overlay_offset_change,
+                               on_overlay_color_click=self._on_overlay_color_click,
                                initial_search=self._search_query,
                                restarted=os.environ.get(RESTART_ENV_VAR) == "1")
         self._restore()
+        self._refresh_overlay_visibility()
         self._keys.start()
         root.update_idletasks(); self._ui.fit()
         self._enumerate_all()
         self._fw.send("sweep", [e.state.app_path for e in self._apps])
         try:
             base = getattr(sys,"_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
-            root.wm_iconbitmap(os.path.join(base,"PushToLagIcon.ico"))
+            root.wm_iconbitmap(os.path.join(base,"PushToLag.ico"))
         except Exception:
             pass
     def _on_add_key(self):
@@ -616,6 +846,22 @@ class App:
     def _apply_app_map(self, app_map):
         self._last_app_map = app_map
         self._apply_filter()
+        for e in self._apps: self._refresh_entry_status(e)
+        self._refresh_overlay_visibility()
+    def _refresh_entry_status(self, entry):
+        """Single source of truth for the status pill:
+        INACTIVE — no app picked, rule failed, or the app just isn't running right now
+        DISCONNECTED — app is running and hooked, but currently blocked by the hotkey
+        CONNECTED — app is running and hooked, not currently blocked"""
+        if entry.attached is None or not entry.attached:
+            entry.set_status("● INACTIVE", MUTED)
+            return
+        if entry.state.app_path not in self._last_app_map:
+            entry.set_status("● INACTIVE", MUTED)
+        elif self._disconnected:
+            entry.set_status("● DISCONNECTED", ACCENT_OFF)
+        else:
+            entry.set_status("● CONNECTED", ACCENT)
     def _on_search_change(self, query):
         self._search_query = query
         self._apply_filter()
@@ -637,9 +883,10 @@ class App:
         self._reconnect.cancel()
         uids = [e.state.uid for e in self._apps if e.state.app_path]
         if not uids: return
+        self._disconnected = True
+        self._overlay.set_state("disconnected")
         self._fw.send("block_batch", (uids, True, self._on_block_timing))
-        for e in self._apps:
-            if e.state.app_path: e.set_status("● DISCONNECTED", ACCENT_OFF)
+        for e in self._apps: self._refresh_entry_status(e)
     def _on_disarm(self):
         self._reconnect.schedule()
     def _on_reconnect_fire(self):
@@ -647,9 +894,10 @@ class App:
     def _do_reconnect(self):
         uids = [e.state.uid for e in self._apps if e.state.app_path]
         if not uids: return
+        self._disconnected = False
+        self._overlay.set_state("connected")
         self._fw.send("block_batch", (uids, False, self._on_block_timing))
-        for e in self._apps:
-            if e.state.app_path: e.set_status("● CONNECTED", ACCENT)
+        for e in self._apps: self._refresh_entry_status(e)
     def _on_block_timing(self, uids, blocked, elapsed_ms):
         action = "disconnect" if blocked else "reconnect"
         text = f"Last {action} ({len(uids)} app{'s' if len(uids)!=1 else ''}): {elapsed_ms:.2f} ms"
@@ -657,6 +905,33 @@ class App:
         else: self._ui.set_reconnect_timing(text)
     def _on_delay_change(self, value):
         self._g_delay = value
+    def _has_active_apps(self):
+        return any(e.attached and e.state.app_path in self._last_app_map for e in self._apps)
+    def _refresh_overlay_visibility(self):
+        if self._ov_enabled and self._has_active_apps(): self._overlay.show()
+        else: self._overlay.hide()
+    def _on_overlay_toggle(self, enabled):
+        self._ov_enabled = enabled
+        self._refresh_overlay_visibility()
+        self._save()
+    def _on_overlay_position_change(self, position):
+        self._ov_position = position
+        self._overlay.set_position(position)
+        self._save()
+    def _on_overlay_offset_change(self, x, y):
+        self._ov_offset_x, self._ov_offset_y = x, y
+        self._overlay.set_offset(x, y)
+        self._save()
+    def _on_overlay_color_click(self, state):
+        current = self._ov_color_connected if state == "connected" else self._ov_color_disconnected
+        title = "Connected overlay color" if state == "connected" else "Disconnected overlay color"
+        _rgb, hex_color = colorchooser.askcolor(color=current, title=title)
+        if hex_color is None: return
+        if state == "connected": self._ov_color_connected = hex_color
+        else: self._ov_color_disconnected = hex_color
+        self._overlay.set_color(state, hex_color)
+        self._ui.set_overlay_color(state, hex_color)
+        self._save()
     def _move(self, entry, direction):
         idx = self._apps.index(entry); new_idx = idx + direction
         if new_idx < 0 or new_idx >= len(self._apps): return
@@ -675,21 +950,21 @@ class App:
     def _add(self, state=None, restored=False):
         state = state or AppState()
         entry = AppEntry(state, len(self._apps))
-        row = AppRow(entry, on_select=self._set_app, on_move=self._move,
-                     on_remove=self._remove, on_refresh=self._enumerate_all)
+        row = AppRow(entry, on_select=self._set_app, on_move=self._move, on_remove=self._remove)
         self._apps.append(entry); self._rows.append(row)
         row.build(self._ui.rows_frame)
         self._refresh_arrows(); self._ui.fit()
         if restored: self._attach(entry)
         else: self._save(); self._enumerate_all()
+        self._refresh_overlay_visibility()
     def _set_app(self, entry, app_path):
         entry.state.app_path = app_path
         self._attach(entry); self._save()
+        self._refresh_overlay_visibility()
     def _attach(self, entry):
         def cb(ok):
-            if ok is None:  entry.set_status("● INACTIVE",   MUTED)
-            elif ok:        entry.set_status("● CONNECTED",  ACCENT)
-            else:           entry.set_status("⚠ Rule error", ACCENT_OFF)
+            entry.attached = ok
+            self._refresh_entry_status(entry)
         self._fw.send("attach", (entry.state.uid, entry.state.app_path, cb))
     def _remove(self, entry):
         idx = self._apps.index(entry)
@@ -697,12 +972,23 @@ class App:
         self._fw.send("remove", entry.state.uid)
         row.destroy()
         for i,(a,w) in enumerate(zip(self._apps, self._rows)): a.index = i; w.set_index(i)
+        if self._disconnected and not any(e.state.app_path for e in self._apps):
+            self._disconnected = False
+            self._overlay.set_state("connected")
+        self._refresh_overlay_visibility()
         self._save(); self._enumerate_all(); self._refresh_arrows(); self._ui.fit()
     def _save(self):
+        overlay = {
+            "overlay_enabled": self._ov_enabled, "overlay_position": self._ov_position,
+            "overlay_offset_x": self._ov_offset_x, "overlay_offset_y": self._ov_offset_y,
+            "overlay_color_connected": self._ov_color_connected,
+            "overlay_color_disconnected": self._ov_color_disconnected,
+        }
         self._settings.save(len(self._apps), self._keys.keybinds, self._g_delay,
-                             [e.state for e in self._apps], self._search_query)
+                             [e.state for e in self._apps], self._search_query, overlay)
     def _quit(self):
         self._save(); self._reconnect.cancel(); self._keys.stop()
+        self._overlay.hide()
         self._fw.send("quit"); self.root.destroy()
 
 def main():
