@@ -4,6 +4,8 @@ Push-to-disconnect for Windows 11. Hold a global hotkey to cut network access to
 
 v1.2 adds an optional on-screen overlay: a small square (green when connected, red when lagging, both colors configurable) that only lights up while it's actually affecting a configured app.
 
+v1.3: the overlay square's size is now configurable. Also includes several performance fixes: rapid hotkey taps no longer queue up a backlog of stale firewall transitions (only the latest desired state is ever applied), redundant Windows Firewall COM writes are skipped when a rule is already in the requested state, and the running-process scan now runs on one persistent worker thread instead of spawning a new thread on every refresh.
+
 ## Requirements
 
 - Windows 11
@@ -43,4 +45,4 @@ Output lands in `dist\PushToLag.exe`. Point an admin-elevated shortcut at it. `-
 
 ## Settings
 
-Stored at `%APPDATA%\PushToLag\prefs.json` — configured apps, keybinds, reconnect delay, and overlay preferences (enabled, position, colors, offset).
+Stored at `%APPDATA%\PushToLag\prefs.json` — configured apps, keybinds, reconnect delay, and overlay preferences (enabled, position, size, colors, offset).

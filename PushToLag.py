@@ -33,7 +33,7 @@ try:
 except ImportError:
     com = None
 
-VERSION = "1.2"
+VERSION = "1.3"
 
 APP_BG="#1e1e1e"; PANEL_BG="#2a2a2a"; COL_BG="#252525"; DIVIDER="#333333"
 ACCENT="#00b894"; ACCENT_OFF="#e17055"; TEXT="#ececec"; MUTED="#888888"
@@ -54,6 +54,7 @@ NET_FW_PROFILE2_ALL = 0x7FFFFFFF
 
 PREFS_PATH = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), "PushToLag", "prefs.json")
 RESTART_ENV_VAR = "PUSHTOLAG_RESTARTED"  # set on the one auto-restart we allow after a backend init failure
+AUTO_REFRESH_MS = 5000  # how often to re-scan running processes, to keep status pills/overlay honest
 
 # ── screen overlay (Windows only; degrades to a plain window elsewhere) ─────
 try:
@@ -86,6 +87,8 @@ OVERLAY_POSITIONS = ("Top-left", "Top-right", "Bottom-left", "Bottom-right")
 DEFAULT_OVERLAY_POSITION = "Top-right"
 DEFAULT_OVERLAY_OFFSET = 24
 DEFAULT_OVERLAY_COLORS = {"connected": ACCENT, "disconnected": ACCENT_OFF}
+DEFAULT_OVERLAY_SIZE = 12
+OVERLAY_SIZE_MIN, OVERLAY_SIZE_MAX = 4, 64
 
 MOUSE_LABELS = {
     mouse.Button.left:"Mouse-Left", mouse.Button.right:"Mouse-Right",
@@ -148,7 +151,7 @@ class Settings:
     @property
     def keybinds(self): return list(self._data.get("keybinds", []))
     @property
-    def delay_ms(self): return int(self._data.get("delay_ms", 250))
+    def delay_ms(self): return max(0, min(10000, int(self._data.get("delay_ms", 250))))
     @property
     def search_query(self): return self._data.get("search_query", "")
     def app_dict(self, i): return self._data.get(f"ch{i}", {})
@@ -161,6 +164,8 @@ class Settings:
     @property
     def overlay_offset_y(self): return int(self._data.get("overlay_offset_y", DEFAULT_OVERLAY_OFFSET))
     def overlay_color(self, state): return self._data.get(f"overlay_color_{state}", DEFAULT_OVERLAY_COLORS[state])
+    @property
+    def overlay_size(self): return int(self._data.get("overlay_size", DEFAULT_OVERLAY_SIZE))
 
 def is_admin():
     try: return bool(ctypes.windll.shell32.IsUserAnAdmin())
@@ -208,8 +213,11 @@ class FirewallBackend:
             self.remove_by_name(out_name); self.remove_by_name(in_name)
             return None
     def set_enabled(self, handle, enabled):
-        try: handle[0].Enabled = enabled; handle[1].Enabled = enabled
-        except Exception: pass
+        try:
+            handle[0].Enabled = enabled; handle[1].Enabled = enabled
+            return True
+        except Exception:
+            return False
     def remove_by_name(self, name):
         try: self._fw.Rules.Remove(name); return True
         except Exception: return False
@@ -250,21 +258,31 @@ def sweep_orphan_rules(backend, keep_app_paths):
 
 class NetGate:
     """Owns one app's in/out rule pair. set_blocked() is the hot path (every key
-    press/release) — just an in-process COM property set."""
+    press/release) — just an in-process COM property set. Tracks the last
+    applied state so a repeat call for a state we're already in is a no-op
+    instead of a redundant COM write."""
     def __init__(self, backend):
         self._backend = backend; self._app_path = None; self._handle = None
+        self._blocked = False
     def activate(self, app_path):
         self.deactivate()
         handle = self._backend.new_rule_pair(app_path)
         if handle is None: return False
         self._app_path, self._handle = app_path, handle
+        self._blocked = False
         return True
     def set_blocked(self, blocked):
-        if self._handle is not None: self._backend.set_enabled(self._handle, blocked)
+        blocked = bool(blocked)
+        if self._handle is None: return False
+        if self._blocked == blocked: return True
+        ok = self._backend.set_enabled(self._handle, blocked)
+        if ok: self._blocked = blocked
+        return ok
     def deactivate(self):
         if not self._app_path: return
         for name in app_rule_names(self._app_path): self._backend.remove_by_name(name)
         self._app_path = self._handle = None
+        self._blocked = False
 
 class FirewallService:
     """Background thread owning all firewall state. Arm/disarm go through block_batch
@@ -284,6 +302,24 @@ class FirewallService:
                 return
             while True:
                 cmd, arg = self._q.get()  # blocks — no periodic wakeup needed
+                if cmd == "block_batch":
+                    # Coalesce back-to-back block_batch requests: if more are
+                    # already queued behind this one, jump straight to the
+                    # newest (running any other queued commands found along
+                    # the way) so a rapid hotkey tap/release/tap can't build a
+                    # backlog of stale, already-superseded COM transitions.
+                    quit_pending = False
+                    while True:
+                        try: nxt_cmd, nxt_arg = self._q.get_nowait()
+                        except queue.Empty: break
+                        if nxt_cmd == "block_batch": cmd, arg = nxt_cmd, nxt_arg
+                        elif nxt_cmd == "quit": quit_pending = True
+                        else: self._handle(nxt_cmd, nxt_arg)
+                    self._handle(cmd, arg)
+                    if quit_pending:
+                        for g in self._gates.values(): g.deactivate()
+                        break
+                    continue
                 if cmd == "quit":
                     for g in self._gates.values(): g.deactivate()
                     break
@@ -303,11 +339,12 @@ class FirewallService:
         elif cmd == "block_batch":
             uids, blocked, cb = arg
             t0 = time.perf_counter()
+            ok = True
             for uid in uids:
                 g = self._gates.get(uid)
-                if g: g.set_blocked(blocked)
+                if g is None or not g.set_blocked(blocked): ok = False
             elapsed_ms = (time.perf_counter() - t0) * 1000
-            if cb: self._root.after(0, cb, uids, blocked, elapsed_ms)
+            if cb: self._root.after(0, cb, uids, blocked, elapsed_ms, ok)
         elif cmd == "cleanup":
             self._root.after(0, arg, cleanup_all_rules(self._backend))
         elif cmd == "sweep":
@@ -330,6 +367,30 @@ def enumerate_running_apps():
         except Exception:
             pass
     return dict(sorted(result.items(), key=lambda kv: kv[1].lower()))
+
+class ProcessScanner:
+    """Long-lived worker for running-process discovery: one persistent thread
+    woken by an Event, rather than a fresh threading.Thread spawned on every
+    refresh. Repeated requests (e.g. app-add, search refresh, manual refresh
+    firing close together) coalesce into a single scan instead of piling up
+    redundant psutil sweeps concurrently."""
+    def __init__(self, root, on_result):
+        self._root = root; self._on_result = on_result
+        self._wake = threading.Event(); self._stop = threading.Event()
+        self._thread = None
+    def start(self):
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+    def request_scan(self):
+        self._wake.set()
+    def stop(self):
+        self._stop.set(); self._wake.set()
+    def _run(self):
+        while True:
+            self._wake.wait(); self._wake.clear()
+            if self._stop.is_set(): return
+            app_map = enumerate_running_apps()
+            if not self._stop.is_set(): self._root.after(0, self._on_result, app_map)
 
 class ReconnectScheduler:
     """One shared timer for the whole app (not one per configured app). schedule()
@@ -506,8 +567,10 @@ class MainWindow:
     def __init__(self, root, *, initial_delay, initial_keybinds, on_add_app, on_add_key,
                  on_remove_key, on_clear_rules, on_delay_change, on_delay_commit, on_search_change, on_refresh,
                  initial_overlay_enabled, initial_overlay_position, initial_overlay_offset_x,
-                 initial_overlay_offset_y, initial_overlay_color_connected, initial_overlay_color_disconnected,
-                 on_overlay_toggle, on_overlay_position_change, on_overlay_offset_change, on_overlay_color_click,
+                 initial_overlay_offset_y, initial_overlay_size, initial_overlay_color_connected,
+                 initial_overlay_color_disconnected,
+                 on_overlay_toggle, on_overlay_position_change, on_overlay_offset_change,
+                 on_overlay_size_change, on_overlay_color_click,
                  initial_search="", restarted=False):
         self.root = root; self._on_remove_key = on_remove_key
         self._was_zoomed = False
@@ -522,9 +585,10 @@ class MainWindow:
         self._build_status_bar(outer)
         self._build_global_bar(outer, initial_delay, on_add_key, on_delay_change, on_delay_commit, restarted,
                                 initial_overlay_enabled, initial_overlay_position, initial_overlay_offset_x,
-                                initial_overlay_offset_y, initial_overlay_color_connected,
+                                initial_overlay_offset_y, initial_overlay_size, initial_overlay_color_connected,
                                 initial_overlay_color_disconnected, on_overlay_toggle,
-                                on_overlay_position_change, on_overlay_offset_change, on_overlay_color_click)
+                                on_overlay_position_change, on_overlay_offset_change, on_overlay_size_change,
+                                on_overlay_color_click)
         hdr = tk.Frame(outer, bg=APP_BG); hdr.pack(fill="x", padx=12, pady=(10,4))
         _lbl(hdr, "Apps", APP_BG, font=FONT_LG_B).pack(side="left")
         _btn(hdr, "+ Add App", lambda: on_add_app(), "#3a3a3a").pack(side="right")
@@ -548,19 +612,20 @@ class MainWindow:
         _lbl(inner, "", PANEL_BG, textvariable=self._reconnect_var, font=FONT_SM).pack(side="right")
     def _build_global_bar(self, parent, initial_delay, on_add_key, on_delay_change, on_delay_commit, restarted,
                            initial_overlay_enabled, initial_overlay_position, initial_overlay_offset_x,
-                           initial_overlay_offset_y, initial_overlay_color_connected,
+                           initial_overlay_offset_y, initial_overlay_size, initial_overlay_color_connected,
                            initial_overlay_color_disconnected, on_overlay_toggle,
-                           on_overlay_position_change, on_overlay_offset_change, on_overlay_color_click):
+                           on_overlay_position_change, on_overlay_offset_change, on_overlay_size_change,
+                           on_overlay_color_click):
         inner = _panel(parent, pady=8, divider=False)
         self._build_keybind_row(inner, on_add_key)
         tk.Frame(inner, bg=DIVIDER, height=1).pack(fill="x", pady=8)
         self._build_delay_row(inner, initial_delay, on_delay_change, on_delay_commit, restarted)
         tk.Frame(inner, bg=DIVIDER, height=1).pack(fill="x", pady=8)
         self._build_overlay_row(inner, initial_overlay_enabled, initial_overlay_position,
-                                 initial_overlay_offset_x, initial_overlay_offset_y,
+                                 initial_overlay_offset_x, initial_overlay_offset_y, initial_overlay_size,
                                  initial_overlay_color_connected, initial_overlay_color_disconnected,
                                  on_overlay_toggle, on_overlay_position_change, on_overlay_offset_change,
-                                 on_overlay_color_click)
+                                 on_overlay_size_change, on_overlay_color_click)
     def _build_keybind_row(self, inner, on_add_key):
         krow = tk.Frame(inner, bg=PANEL_BG); krow.pack(fill="x")
         _lbl(krow, "Global Keybind (holds ALL apps)", PANEL_BG, font=FONT_LG_B).pack(side="left")
@@ -583,8 +648,8 @@ class MainWindow:
         scale.bind("<Button-2>", lambda e: "break")
         scale.bind("<Button-3>", lambda e: "break")
     def _build_overlay_row(self, inner, initial_enabled, initial_position, initial_offset_x,
-                            initial_offset_y, initial_color_connected, initial_color_disconnected,
-                            on_toggle, on_position_change, on_offset_change, on_color_click):
+                            initial_offset_y, initial_size, initial_color_connected, initial_color_disconnected,
+                            on_toggle, on_position_change, on_offset_change, on_size_change, on_color_click):
         orow = tk.Frame(inner, bg=PANEL_BG); orow.pack(fill="x")
         _lbl(orow, "Network Overlay", PANEL_BG, font=FONT_LG_B).pack(side="left")
         self._ovar = tk.BooleanVar(value=initial_enabled)
@@ -619,10 +684,19 @@ class MainWindow:
                                                                      self._safe_int(self._oy_var, initial_offset_y)))
         tk.Entry(orow3, textvariable=self._oy_var, width=5, bg=COL_BG, fg=TEXT,
                  insertbackground=TEXT, relief="flat").pack(side="left", padx=(4,0))
+        _lbl(orow3, "Size:", PANEL_BG, font=FONT_SM).pack(side="left", padx=(16,0))
+        self._osize_var = tk.IntVar(value=initial_size)
+        self._osize_var.trace_add("write", lambda *_: on_size_change(
+            self._safe_int(self._osize_var, initial_size, OVERLAY_SIZE_MIN, OVERLAY_SIZE_MAX)))
+        tk.Spinbox(orow3, textvariable=self._osize_var, width=4, bg=COL_BG, fg=TEXT,
+                   insertbackground=TEXT, relief="flat", from_=OVERLAY_SIZE_MIN, to=OVERLAY_SIZE_MAX,
+                   buttonbackground=PANEL_BG).pack(side="left", padx=(4,0))
     @staticmethod
-    def _safe_int(var, default):
-        try: return max(0, int(var.get()))
+    def _safe_int(var, default, lo=0, hi=None):
+        try: v = int(var.get())
         except (tk.TclError, ValueError): return default
+        v = max(lo, v)
+        return min(hi, v) if hi is not None else v
     def set_overlay_color(self, state, color):
         btn = self._ocolor_connected_btn if state == "connected" else self._ocolor_disconnected_btn
         if btn: btn.config(bg=color)
@@ -657,8 +731,6 @@ class Overlay:
     connected, red while lagging (both colors user-configurable).
     Uses Windows click-through and capture-exclusion features when available."""
 
-    _SQUARE_SIZE = 12
-
     def __init__(self, root):
         self._root = root
         self._win = None
@@ -666,12 +738,21 @@ class Overlay:
         self._position = DEFAULT_OVERLAY_POSITION
         self._offset_x = DEFAULT_OVERLAY_OFFSET
         self._offset_y = DEFAULT_OVERLAY_OFFSET
+        self._size = DEFAULT_OVERLAY_SIZE
         self._colors = dict(DEFAULT_OVERLAY_COLORS)
         self._state = "connected"
 
     def set_position(self, position):
         self._position = position if position in OVERLAY_POSITIONS else DEFAULT_OVERLAY_POSITION
         self._reposition()
+
+    def set_size(self, size):
+        self._size = max(OVERLAY_SIZE_MIN, min(OVERLAY_SIZE_MAX, int(size)))
+        if self._win is not None:
+            # The Frame's width/height are fixed at creation time — rebuild
+            # it in place rather than trying to resize the existing widget.
+            self.hide()
+            self.show()
 
     def set_offset(self, offset_x, offset_y):
         """Set the horizontal and vertical distance from the selected corner."""
@@ -702,7 +783,7 @@ class Overlay:
             pass
         self._square = tk.Frame(
             win, bg=self._colors.get(self._state, DEFAULT_OVERLAY_COLORS["connected"]),
-            width=self._SQUARE_SIZE, height=self._SQUARE_SIZE,
+            width=self._size, height=self._size,
         )
         self._square.pack_propagate(False)
         self._square.pack()
@@ -769,16 +850,20 @@ class App:
         self._ov_position = self._settings.overlay_position
         self._ov_offset_x = self._settings.overlay_offset_x
         self._ov_offset_y = self._settings.overlay_offset_y
+        self._ov_size = self._settings.overlay_size
         self._ov_color_connected = self._settings.overlay_color("connected")
         self._ov_color_disconnected = self._settings.overlay_color("disconnected")
         self._overlay = Overlay(root)
         self._overlay.set_position(self._ov_position)
         self._overlay.set_offset(self._ov_offset_x, self._ov_offset_y)
+        self._overlay.set_size(self._ov_size)
         self._overlay.set_color("connected", self._ov_color_connected)
         self._overlay.set_color("disconnected", self._ov_color_disconnected)
         self._overlay.set_state("connected")
         self._fw = FirewallService(root, on_error=self._on_backend_error)
         self._fw.start()
+        self._scanner = ProcessScanner(root, self._apply_app_map)
+        self._scanner.start()
         self._reconnect = ReconnectScheduler(lambda: self._g_delay, self._on_reconnect_fire)
         self._keys = KeybindManager(root, self._settings.keybinds,
                                      on_arm=self._on_arm, on_disarm=self._on_disarm,
@@ -793,11 +878,13 @@ class App:
                                initial_overlay_position=self._ov_position,
                                initial_overlay_offset_x=self._ov_offset_x,
                                initial_overlay_offset_y=self._ov_offset_y,
+                               initial_overlay_size=self._ov_size,
                                initial_overlay_color_connected=self._ov_color_connected,
                                initial_overlay_color_disconnected=self._ov_color_disconnected,
                                on_overlay_toggle=self._on_overlay_toggle,
                                on_overlay_position_change=self._on_overlay_position_change,
                                on_overlay_offset_change=self._on_overlay_offset_change,
+                               on_overlay_size_change=self._on_overlay_size_change,
                                on_overlay_color_click=self._on_overlay_color_click,
                                initial_search=self._search_query,
                                restarted=os.environ.get(RESTART_ENV_VAR) == "1")
@@ -807,6 +894,8 @@ class App:
         root.update_idletasks(); self._ui.fit()
         self._enumerate_all()
         self._fw.send("sweep", [e.state.app_path for e in self._apps])
+        self._auto_refresh_id = None
+        self._schedule_auto_refresh()
         try:
             base = getattr(sys,"_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
             root.wm_iconbitmap(os.path.join(base,"PushToLag.ico"))
@@ -872,12 +961,18 @@ class App:
             {path: name for path, name in self._last_app_map.items() if q in name.lower()}
         for w in self._rows: w.refresh_apps(self._last_app_map, filtered)
     def _enumerate_all(self):
-        # Runs off the firewall thread's queue so a slow process scan can
+        # Runs on its own persistent scanner thread so a slow process scan can
         # never delay a pending hotkey toggle.
-        def worker():
-            app_map = enumerate_running_apps()
-            self.root.after(0, self._apply_app_map, app_map)
-        threading.Thread(target=worker, daemon=True).start()
+        self._scanner.request_scan()
+    def _schedule_auto_refresh(self):
+        self._auto_refresh_id = self.root.after(AUTO_REFRESH_MS, self._auto_refresh_tick)
+    def _auto_refresh_tick(self):
+        # Keeps status pills/overlay honest as apps launch or close on their
+        # own, without waiting on a manual Refresh click. Purely cosmetic
+        # upkeep — a scan started here never re-touches firewall attach
+        # state, only what _apply_app_map already does for the manual path.
+        self._enumerate_all()
+        self._schedule_auto_refresh()
     # arm/disarm are batched across every configured app instead of looping per-entry
     def _on_arm(self):
         self._reconnect.cancel()
@@ -898,9 +993,15 @@ class App:
         self._overlay.set_state("connected")
         self._fw.send("block_batch", (uids, False, self._on_block_timing))
         for e in self._apps: self._refresh_entry_status(e)
-    def _on_block_timing(self, uids, blocked, elapsed_ms):
+    def _on_block_timing(self, uids, blocked, elapsed_ms, ok=True):
         action = "disconnect" if blocked else "reconnect"
-        text = f"Last {action} ({len(uids)} app{'s' if len(uids)!=1 else ''}): {elapsed_ms:.2f} ms"
+        if not ok:
+            # A failed firewall write already leaves the app in whatever state
+            # it was in before — don't report its duration as if it were a
+            # successful disconnect/reconnect measurement.
+            text = f"Last {action}: failed"
+        else:
+            text = f"Last {action} ({len(uids)} app{'s' if len(uids)!=1 else ''}): {elapsed_ms:.2f} ms"
         if blocked: self._ui.set_disconnect_timing(text)
         else: self._ui.set_reconnect_timing(text)
     def _on_delay_change(self, value):
@@ -921,6 +1022,10 @@ class App:
     def _on_overlay_offset_change(self, x, y):
         self._ov_offset_x, self._ov_offset_y = x, y
         self._overlay.set_offset(x, y)
+        self._save()
+    def _on_overlay_size_change(self, size):
+        self._ov_size = size
+        self._overlay.set_size(size)
         self._save()
     def _on_overlay_color_click(self, state):
         current = self._ov_color_connected if state == "connected" else self._ov_color_disconnected
@@ -981,14 +1086,19 @@ class App:
         overlay = {
             "overlay_enabled": self._ov_enabled, "overlay_position": self._ov_position,
             "overlay_offset_x": self._ov_offset_x, "overlay_offset_y": self._ov_offset_y,
+            "overlay_size": self._ov_size,
             "overlay_color_connected": self._ov_color_connected,
             "overlay_color_disconnected": self._ov_color_disconnected,
         }
         self._settings.save(len(self._apps), self._keys.keybinds, self._g_delay,
                              [e.state for e in self._apps], self._search_query, overlay)
     def _quit(self):
+        if self._auto_refresh_id is not None:
+            self.root.after_cancel(self._auto_refresh_id)
+            self._auto_refresh_id = None
         self._save(); self._reconnect.cancel(); self._keys.stop()
         self._overlay.hide()
+        self._scanner.stop()
         self._fw.send("quit"); self.root.destroy()
 
 def main():
