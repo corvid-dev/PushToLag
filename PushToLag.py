@@ -1,18 +1,18 @@
 """
-PushToLag v1.2 — Push-to-Disconnect for Windows 11
+PushToLag v1.31 — Push-to-Disconnect for Windows 11
 Hold ONE global key to cut network access to every app you've added, release to
 reconnect them all after a shared delay. Uses Windows Firewall rules per app,
 driven entirely through the in-process Windows Firewall COM API (no netsh.exe
 shelling out — every rule toggle is just a property set).
 
-v1.2 adds an optional on-screen overlay: a small square (green/red, both
+Includes an optional on-screen overlay: a small square (green/red, both
 colors user-configurable) that shows whether the network is currently
 connected or disconnected.
 
 pip install pynput psutil comtypes
 
 Must run elevated (Administrator) — launch it via a shortcut set to "Run as administrator".
-It no longer self-elevates; if launched without admin rights it warns and exits.
+It does not self-elevate; if launched without admin rights it warns and exits.
 """
 import os, sys, json, uuid, queue, threading, hashlib, ctypes, time
 from dataclasses import dataclass, field
@@ -33,7 +33,7 @@ try:
 except ImportError:
     com = None
 
-VERSION = "1.3"
+VERSION = "1.31"
 
 APP_BG="#1e1e1e"; PANEL_BG="#2a2a2a"; COL_BG="#252525"; DIVIDER="#333333"
 ACCENT="#00b894"; ACCENT_OFF="#e17055"; TEXT="#ececec"; MUTED="#888888"
@@ -135,9 +135,9 @@ class Settings:
             with open(PREFS_PATH, encoding="utf-8") as f: self._data = json.load(f)
         except Exception:
             self._data = {}
-    def save(self, app_count, keybinds, delay_ms, app_states, search_query, overlay):
+    def save(self, app_count, keybinds, delay_ms, app_states, search_query, overlay, known_apps):
         data = {"app_count": app_count, "keybinds": list(keybinds), "delay_ms": delay_ms,
-                "search_query": search_query}
+                "search_query": search_query, "known_apps": known_apps}
         data.update({f"ch{i}": s.to_dict() for i, s in enumerate(app_states)})
         data.update(overlay)
         self._data = data
@@ -154,6 +154,8 @@ class Settings:
     def delay_ms(self): return max(0, min(10000, int(self._data.get("delay_ms", 250))))
     @property
     def search_query(self): return self._data.get("search_query", "")
+    @property
+    def known_apps(self): return dict(self._data.get("known_apps", {}))
     def app_dict(self, i): return self._data.get(f"ch{i}", {})
     @property
     def overlay_enabled(self): return bool(self._data.get("overlay_enabled", False))
@@ -433,12 +435,8 @@ NONE_OPTION = "NONE"
 
 class AppRow:
     """One compact row: reorder arrows, app picker, status, remove. The
-    picker is a plain readonly combobox — filtering now happens once, up in
-    the header search box, which narrows what every row's dropdown offers.
-    (Earlier revisions tried filtering per-row, live, as you typed into each
-    combobox — first by forcing ttk's native popdown to redraw mid-keystroke,
-    then via inline autocomplete, then a custom popup Listbox. All three
-    were real complexity for a job a single shared filter does more simply.)
+    picker is a plain readonly combobox; filtering happens once, up in the
+    header search box, which narrows what every row's dropdown offers.
     refresh_apps() takes both the full process map (to correctly tell "not
     running" apart from "just filtered out") and the header-filtered map
     (what the dropdown actually offers)."""
@@ -478,18 +476,23 @@ class AppRow:
     def set_status(self, text, color):
         if self._svar: self._svar.set(text)
         if self._slbl: self._slbl.config(fg=color)
-    def refresh_apps(self, app_map, filtered_map):
-        self._display_to_path = {name: path for path, name in filtered_map.items()}
-        values = [NONE_OPTION] + list(filtered_map.values())
+    def refresh_apps(self, live_map, filtered_map):
+        """filtered_map is path -> display name for every app worth offering
+        (currently running or previously configured), already narrowed by the
+        header search box. live_map is the subset that's actually running
+        right now, used only to decide whether to tag an entry "(not running)"."""
+        self._display_to_path = {}
+        values = [NONE_OPTION]
+        for p, name in filtered_map.items():
+            display = name if p in live_map else f"(not running) {name}"
+            values.append(display); self._display_to_path[display] = p
         path = self._entry.state.app_path
-        if path in app_map:
-            display = app_map[path]
-            if display not in self._display_to_path:
-                # currently selected but filtered out by the search box —
-                # keep it visible/selectable rather than pretending it's gone
-                values.append(display); self._display_to_path[display] = path
-            current = display
+        if path and path in filtered_map:
+            name = filtered_map[path]
+            current = name if path in live_map else f"(not running) {name}"
         elif path:
+            # configured but filtered out by the search box — keep it
+            # visible/selectable rather than pretending it's gone
             tag = f"(not running) {path}"
             values.append(tag); self._display_to_path[tag] = path
             current = tag
@@ -839,9 +842,16 @@ class App:
         root.title(f"PushToLag v{VERSION}")
         root.resizable(True,True)
         root.protocol("WM_DELETE_WINDOW", self._quit)
+        # Building MainWindow below wires tk.IntVar traces (offset/size spinboxes
+        # etc.) that fire once as soon as their widgets are constructed — before
+        # _restore() has repopulated self._apps. Block _save() until restore is
+        # done so that spurious early write doesn't persist app_count=0 and wipe
+        # out every configured app on the next launch.
+        self._restoring = True
         self._settings = Settings()
         self._apps: list[AppEntry] = []
         self._rows: list[AppRow] = []
+        self._known_apps = self._settings.known_apps  # path -> display name, incl. not-currently-running
         self._g_delay = self._settings.delay_ms
         self._last_app_map = {}
         self._search_query = self._settings.search_query
@@ -889,6 +899,7 @@ class App:
                                initial_search=self._search_query,
                                restarted=os.environ.get(RESTART_ENV_VAR) == "1")
         self._restore()
+        self._restoring = False
         self._refresh_overlay_visibility()
         self._keys.start()
         root.update_idletasks(); self._ui.fit()
@@ -934,9 +945,17 @@ class App:
 
     def _apply_app_map(self, app_map):
         self._last_app_map = app_map
+        # Remember every app we've ever seen running, so it stays pickable
+        # in every row's dropdown even after it's closed (e.g. FiveM's game
+        # process, which only exists while the game is open).
+        known_changed = False
+        for path, name in app_map.items():
+            if self._known_apps.get(path) != name:
+                self._known_apps[path] = name; known_changed = True
         self._apply_filter()
         for e in self._apps: self._refresh_entry_status(e)
         self._refresh_overlay_visibility()
+        if known_changed: self._save()
     def _refresh_entry_status(self, entry):
         """Single source of truth for the status pill:
         INACTIVE — no app picked, rule failed, or the app just isn't running right now
@@ -957,8 +976,11 @@ class App:
         self._save()
     def _apply_filter(self):
         q = self._search_query.strip().lower()
-        filtered = self._last_app_map if not q else \
-            {path: name for path, name in self._last_app_map.items() if q in name.lower()}
+        # Offer every known app (currently running or previously configured),
+        # with live process names taking priority over remembered ones.
+        combined = dict(self._known_apps); combined.update(self._last_app_map)
+        filtered = combined if not q else \
+            {path: name for path, name in combined.items() if q in name.lower()}
         for w in self._rows: w.refresh_apps(self._last_app_map, filtered)
     def _enumerate_all(self):
         # Runs on its own persistent scanner thread so a slow process scan can
@@ -1051,7 +1073,12 @@ class App:
         for i,w in enumerate(self._rows): w.update_arrows(is_first=i==0, is_last=i==n-1)
     def _restore(self):
         for i in range(self._settings.app_count):
-            self._add(AppState.from_dict(self._settings.app_dict(i)), restored=True)
+            state = AppState.from_dict(self._settings.app_dict(i))
+            if state.app_path and state.app_path not in self._known_apps:
+                # Seen in a past session but not yet re-observed running this
+                # session — best-effort name until the next scan finds it.
+                self._known_apps[state.app_path] = os.path.basename(state.app_path)
+            self._add(state, restored=True)
     def _add(self, state=None, restored=False):
         state = state or AppState()
         entry = AppEntry(state, len(self._apps))
@@ -1083,6 +1110,7 @@ class App:
         self._refresh_overlay_visibility()
         self._save(); self._enumerate_all(); self._refresh_arrows(); self._ui.fit()
     def _save(self):
+        if self._restoring: return
         overlay = {
             "overlay_enabled": self._ov_enabled, "overlay_position": self._ov_position,
             "overlay_offset_x": self._ov_offset_x, "overlay_offset_y": self._ov_offset_y,
@@ -1091,7 +1119,7 @@ class App:
             "overlay_color_disconnected": self._ov_color_disconnected,
         }
         self._settings.save(len(self._apps), self._keys.keybinds, self._g_delay,
-                             [e.state for e in self._apps], self._search_query, overlay)
+                             [e.state for e in self._apps], self._search_query, overlay, self._known_apps)
     def _quit(self):
         if self._auto_refresh_id is not None:
             self.root.after_cancel(self._auto_refresh_id)

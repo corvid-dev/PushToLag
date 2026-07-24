@@ -2,9 +2,9 @@
 
 Push-to-disconnect for Windows 11. Hold a global hotkey to cut network access to whichever apps you've configured, release to reconnect them after a delay. Uses the in-process Windows Firewall COM API — no `netsh.exe` calls.
 
-v1.2 adds an optional on-screen overlay: a small square (green when connected, red when lagging, both colors configurable) that only lights up while it's actually affecting a configured app.
+Includes an optional on-screen overlay: a small square (green when connected, red when lagging, both colors and size configurable) that only lights up while it's actually affecting a configured app.
 
-v1.3: the overlay square's size is now configurable. Also includes several performance fixes: rapid hotkey taps no longer queue up a backlog of stale firewall transitions (only the latest desired state is ever applied), redundant Windows Firewall COM writes are skipped when a rule is already in the requested state, and the running-process scan now runs on one persistent worker thread instead of spawning a new thread on every refresh.
+Rapid hotkey taps don't queue up a backlog of stale firewall transitions — only the latest desired state is ever applied. Redundant Windows Firewall COM writes are skipped when a rule is already in the requested state, and the running-process scan runs on one persistent worker thread. Apps you've configured stay listed and selectable even while they're not currently running.
 
 ## Requirements
 
